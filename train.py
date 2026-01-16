@@ -147,7 +147,6 @@ def evaluate(val_dataloader):
     model.train()
 
 
-tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
 if __name__ == '__main__':
     device_type = "cuda" if device.startswith("cuda") else "cpu"
     torch.manual_seed(seed)
@@ -155,6 +154,9 @@ if __name__ == '__main__':
         torch.cuda.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
     print(f"Save Path: {save_path}")
+
+    # tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
 
     # model
     model = AutoModelForCausalLM.from_pretrained('ekwek/Soprano-80M')
@@ -194,10 +196,10 @@ if __name__ == '__main__':
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # Text token embeddings (but not positional), cross-attention, speaker/adapters get higher LR
-        # Avoid matching 'wpe' (positional embeddings) or general layer names
+        # Text token embeddings (wte), cross-attention, speaker/adapters get higher LR
+        # Use specific patterns to avoid false positives
         if any(keyword in name for keyword in ['wte', 'cross_attn', 'speaker', 'adapter']) or \
-           ('embed' in name.lower() and 'token' in name.lower()):
+           name.endswith('token_embeddings') or 'token_embed' in name:
             text_params.append(param)
         else:
             base_params.append(param)

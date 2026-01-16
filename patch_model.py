@@ -44,11 +44,10 @@ def patch_model(base_path, output_path):
         print("WARNING: pad_token_id == eos_token_id. This can break stopping.")
         # Prefer adding a distinct PAD if possible
         if tok.convert_tokens_to_ids("[PAD]") == tok.unk_token_id:
+            # [PAD] doesn't exist, add it as special token
             tok.add_special_tokens({"pad_token": "[PAD]"})
-            tok.pad_token = "[PAD]"
-            tok.pad_token_id = tok.convert_tokens_to_ids("[PAD]")
         else:
-            # [PAD] already exists, use it
+            # [PAD] already exists in vocab, use it
             tok.pad_token = "[PAD]"
             tok.pad_token_id = tok.convert_tokens_to_ids("[PAD]")
 
