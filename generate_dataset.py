@@ -20,6 +20,7 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 from encoder.codec import Encoder
+from text_normalizer import normalize_text
 
 
 SAMPLE_RATE = 32000
@@ -52,7 +53,11 @@ def main():
     with open(f'{input_dir}/metadata.txt', encoding='utf-8') as f:
         data = f.read().split('\n')
         for line in data:
+            if not line.strip():
+                continue  # Skip empty lines
             filename, transcript = line.split('|', maxsplit=1)
+            # Apply text normalization
+            transcript = normalize_text(transcript)
             files.append((filename, transcript))
     print(f'{len(files)} samples located in directory.')
 

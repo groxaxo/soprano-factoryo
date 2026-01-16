@@ -42,18 +42,18 @@ args = get_args()
 # training hyperparameters
 device = 'cuda:0'
 seed = 1337
-max_lr = 5e-4
+max_lr = 2e-5  # reduced from 5e-4 to prevent catastrophic forgetting
 warmup_ratio = 0.1
-cooldown_ratio = 0.1
+cooldown_ratio = 0.3  # increased for WSD schedule
 min_lr = 0.1 * max_lr
 batch_size = 4
 grad_accum_steps = 1
 seq_len = 1024
 val_freq = 250
-text_factor = 0.0 # currently does not train on text inputs, you can increase to change this
+text_factor = 0.1  # trains on both text and audio tokens (prevents modality collapse)
 max_steps = 10000
 betas = (0.9, 0.95)
-weight_decay = 0.1
+weight_decay = 0.01  # reduced from 0.1
 train_dataset_path = f'{args.input_dir}/train.json'
 val_dataset_path = f'{args.input_dir}/val.json'
 save_path = args.save_dir
@@ -102,11 +102,14 @@ def compute_loss(logits, y, num_steps):
     audio_mask = torch.logical_and(y>=3, y<=8003).view(-1)
     audio_loss = loss[audio_mask].mean()
     text_loss = loss[~audio_mask].mean()
-    acc = (logits.argmax(dim=-1) == y).view(-1)[audio_mask].to(torch.float32).mean()
+    predictions = logits.argmax(dim=-1).view(-1)
+    audio_acc = (predictions == labels)[audio_mask].to(torch.float32).mean()
+    text_acc = (predictions == labels)[~audio_mask].to(torch.float32).mean()
     audio_loss = audio_loss / num_steps
     text_loss = text_loss / num_steps
-    acc = acc / num_steps
-    return audio_loss, text_loss, acc
+    audio_acc = audio_acc / num_steps
+    text_acc = text_acc / num_steps
+    return audio_loss, text_loss, audio_acc, text_acc
 
 def evaluate(val_dataloader):
     model.eval()
@@ -114,18 +117,20 @@ def evaluate(val_dataloader):
     with torch.no_grad():
         val_audio_loss_accum = torch.tensor(0.0).to(device)
         val_text_loss_accum = torch.tensor(0.0).to(device)
-        val_acc_accum = torch.tensor(0.0).to(device)
+        val_audio_acc_accum = torch.tensor(0.0).to(device)
+        val_text_acc_accum = torch.tensor(0.0).to(device)
         val_loss_steps = 1
         for _ in range(val_loss_steps):
             x, y = next(val_dataloader_it)
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits = model(x).logits
-                audio_loss, text_loss, acc = compute_loss(logits, y, val_loss_steps)
+                audio_loss, text_loss, audio_acc, text_acc = compute_loss(logits, y, val_loss_steps)
             val_audio_loss_accum += audio_loss.detach()
             val_text_loss_accum += text_loss.detach()
-            val_acc_accum += acc.detach()
-        print(f"validation text loss: {val_text_loss_accum.item():.4f}\tvalidation audio loss: {val_audio_loss_accum.item():.4f}\tvalidation acc: {val_acc_accum.item():.4f}")
+            val_audio_acc_accum += audio_acc.detach()
+            val_text_acc_accum += text_acc.detach()
+        print(f"validation | txt_L: {val_text_loss_accum.item():.4f} | aud_L: {val_audio_loss_accum.item():.4f} | txt_acc: {val_text_acc_accum.item():.2%} | aud_acc: {val_audio_acc_accum.item():.2%}")
     model.train()
 
 
@@ -183,7 +188,8 @@ if __name__ == '__main__':
         opt.zero_grad()
         audio_loss_accum = 0.0
         text_loss_accum = 0.0
-        acc_accum = 0.0
+        audio_acc_accum = 0.0
+        text_acc_accum = 0.0
         for micro_step in range(grad_accum_steps):
             try:
                 x, y = next(dataloader_it)
@@ -194,10 +200,11 @@ if __name__ == '__main__':
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits = model(x).logits
-                audio_loss, text_loss, acc = compute_loss(logits, y, grad_accum_steps)
+                audio_loss, text_loss, audio_acc, text_acc = compute_loss(logits, y, grad_accum_steps)
             audio_loss_accum += audio_loss.detach()
             text_loss_accum += text_loss.detach()
-            acc_accum += acc.detach()
+            audio_acc_accum += audio_acc.detach()
+            text_acc_accum += text_acc.detach()
             total_loss = audio_loss + text_factor*text_loss
             total_loss.backward()
 
@@ -211,7 +218,7 @@ if __name__ == '__main__':
         end = time.time()
         dt = (end-start)*1000
         tokens_per_second = (batch_size*seq_len*grad_accum_steps) / (end-start)
-        tqdm_log = f'text loss: {text_loss_accum.item():.3f} | audio loss: {audio_loss_accum.item():.3f} | acc: {acc_accum.item():.4f} | lr: {lr:.2e} | norm: {norm:.3f} | time: {dt:.2f} ms | {tokens_per_second:.2f} t/s'
+        tqdm_log = f'txt_L: {text_loss_accum.item():.3f} | aud_L: {audio_loss_accum.item():.3f} | txt_acc: {text_acc_accum.item():.2%} | aud_acc: {audio_acc_accum.item():.2%} | lr: {lr:.2e} | norm: {norm:.3f} | {dt:.0f}ms | {tokens_per_second:.0f}t/s'
         pbar.set_description(tqdm_log)
 
     print(f"Training complete. Saving model at {save_path}")
