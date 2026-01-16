@@ -238,7 +238,7 @@ if __name__ == '__main__':
             audio_acc_accum += audio_acc.detach()
             text_acc_accum += text_acc.detach()
             text_factor = get_text_factor(step)
-            total_loss = audio_loss + text_factor*text_loss
+            total_loss = audio_loss + text_factor * text_loss
             total_loss.backward()
 
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)

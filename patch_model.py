@@ -12,10 +12,12 @@ python patch_model.py --base path/to/base/model --output path/to/output/model
 import os
 import sys
 import argparse
+from pathlib import Path
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(str(Path(__file__).parent.parent))
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 
 
 def patch_model(base_path, output_path):
