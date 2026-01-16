@@ -45,8 +45,12 @@ def patch_model(base_path, output_path):
         # Prefer adding a distinct PAD if possible
         if tok.convert_tokens_to_ids("[PAD]") == tok.unk_token_id:
             tok.add_special_tokens({"pad_token": "[PAD]"})
-        tok.pad_token = "[PAD]"
-        tok.pad_token_id = tok.convert_tokens_to_ids("[PAD]")
+            tok.pad_token = "[PAD]"
+            tok.pad_token_id = tok.convert_tokens_to_ids("[PAD]")
+        else:
+            # [PAD] already exists, use it
+            tok.pad_token = "[PAD]"
+            tok.pad_token_id = tok.convert_tokens_to_ids("[PAD]")
 
     print(f"EOS: {tok.eos_token} id={tok.eos_token_id}")
     print(f"PAD: {tok.pad_token} id={tok.pad_token_id}")
@@ -74,12 +78,17 @@ def patch_model(base_path, output_path):
         shutil.copy(base_decoder, out_decoder)
         print("Copied decoder.pth")
     else:
-        try:
-            from huggingface_hub import hf_hub_download
-            print("Downloading decoder.pth...")
-            hf_hub_download(repo_id=base_path, filename="decoder.pth", local_dir=output_path)
-        except Exception as e:
-            print(f"Could not download decoder.pth: {e}")
+        # Try to download from HuggingFace if base_path looks like a repo ID
+        # (doesn't start with . or / and doesn't contain path separators beyond one /)
+        if not base_path.startswith(('.', '/')) and base_path.count('/') <= 1:
+            try:
+                from huggingface_hub import hf_hub_download
+                print(f"Downloading decoder.pth from HuggingFace repo {base_path}...")
+                hf_hub_download(repo_id=base_path, filename="decoder.pth", local_dir=output_path)
+            except Exception as e:
+                print(f"Could not download decoder.pth: {e}")
+        else:
+            print(f"decoder.pth not found at {base_decoder} and base_path appears to be a local path.")
 
 
 if __name__ == "__main__":

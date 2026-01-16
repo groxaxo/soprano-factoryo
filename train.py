@@ -189,12 +189,15 @@ if __name__ == '__main__':
     # Higher LR for text embeddings and conditioning pathway
     text_params = []
     base_params = []
+    lr_ratio = text_lr / base_lr  # 5x ratio for text pathway
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # Text embeddings, cross-attention, speaker/adapters get higher LR
-        if any(keyword in name.lower() for keyword in ['embed', 'cross', 'speaker', 'adapter', 'text']):
+        # Text token embeddings (but not positional), cross-attention, speaker/adapters get higher LR
+        # Avoid matching 'wpe' (positional embeddings) or general layer names
+        if any(keyword in name for keyword in ['wte', 'cross_attn', 'speaker', 'adapter']) or \
+           ('embed' in name.lower() and 'token' in name.lower()):
             text_params.append(param)
         else:
             base_params.append(param)
@@ -239,9 +242,9 @@ if __name__ == '__main__':
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         base_lr_current = get_lr(step)
         # Apply different LRs to parameter groups
-        # base_params get base_lr, text_params get text_lr (5x higher)
+        # base_params get base_lr, text_params get lr_ratio times higher
         opt.param_groups[0]['lr'] = base_lr_current
-        opt.param_groups[1]['lr'] = base_lr_current * (text_lr / base_lr)
+        opt.param_groups[1]['lr'] = base_lr_current * lr_ratio
         opt.step()
         torch.cuda.synchronize()
         total_tokens = step * batch_size*seq_len*grad_accum_steps
