@@ -11,6 +11,8 @@ Key transformations:
 import re
 import unicodedata
 
+NORMALIZER_VERSION = "1.0.0"
+
 
 def normalize_text(text: str) -> str:
     """

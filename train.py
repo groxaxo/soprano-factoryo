@@ -42,18 +42,18 @@ args = get_args()
 # training hyperparameters
 device = 'cuda:0'
 seed = 1337
-max_lr = 2e-5  # reduced from 5e-4 to prevent catastrophic forgetting
-warmup_ratio = 0.1
-cooldown_ratio = 0.3  # increased for WSD schedule
-min_lr = 0.1 * max_lr
+base_lr = 1e-5  # base learning rate for most weights
+text_lr = 5e-5  # higher LR for text, cross-attn, speaker/adapters
+warmup_steps_target = 1500  # warmup steps
+min_lr = 2e-6  # minimum learning rate for cosine decay
 batch_size = 4
-grad_accum_steps = 1
+grad_accum_steps = 4  # effective batch size: 4 * 4 = 16
 seq_len = 1024
 val_freq = 250
-text_factor = 0.1  # trains on both text and audio tokens (prevents modality collapse)
-max_steps = 10000
+max_steps = 15000  # 12k-20k range, using 15k as middle ground
 betas = (0.9, 0.95)
-weight_decay = 0.01  # reduced from 0.1
+weight_decay = 0.01
+grad_clip = 1.0
 train_dataset_path = f'{args.input_dir}/train.json'
 val_dataset_path = f'{args.input_dir}/val.json'
 save_path = args.save_dir
@@ -63,12 +63,25 @@ def worker_seed_init(_):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-def get_lr(it): # WSD schedule
-    if it<warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    if it<max_steps-cooldown_steps:
-        return max_lr
-    return min_lr + (max_lr-min_lr) * ((max_steps-it) / cooldown_steps)
+def get_lr(it):
+    """Cosine learning rate schedule with warmup."""
+    if it < warmup_steps_target:
+        # Linear warmup
+        return base_lr * (it + 1) / warmup_steps_target
+    # Cosine decay
+    progress = (it - warmup_steps_target) / (max_steps - warmup_steps_target)
+    return min_lr + (base_lr - min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
+
+def get_text_factor(it):
+    """Ramped text_factor schedule to prevent conditioning collapse."""
+    if it < 500:
+        return 0.00
+    elif it < 2000:
+        return 0.05
+    elif it < 8000:
+        return 0.10
+    else:
+        return 0.15  # cap at 0.15
 
 def collate_pack(texts):
     tokens_batch = tokenizer(texts, padding=False, truncation=False)
@@ -134,7 +147,6 @@ def evaluate(val_dataloader):
     model.train()
 
 
-tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
 if __name__ == '__main__':
     device_type = "cuda" if device.startswith("cuda") else "cpu"
     torch.manual_seed(seed)
@@ -143,9 +155,8 @@ if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
     print(f"Save Path: {save_path}")
 
-    # lr schedule
-    warmup_steps = int(max_steps * warmup_ratio)
-    cooldown_steps = int(max_steps * cooldown_ratio)
+    # tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
 
     # model
     model = AutoModelForCausalLM.from_pretrained('ekwek/Soprano-80M')
@@ -176,8 +187,29 @@ if __name__ == '__main__':
         collate_fn=collate_pack,
     )
 
-    # optimizer
-    opt = torch.optim.AdamW(model.parameters(), max_lr, betas=betas, weight_decay=weight_decay, fused=True)
+    # optimizer with parameter groups
+    # Higher LR for text embeddings and conditioning pathway
+    text_params = []
+    base_params = []
+    lr_ratio = text_lr / base_lr  # 5x ratio for text pathway
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Text token embeddings (wte), cross-attention, speaker/adapters get higher LR
+        # Use specific patterns to avoid false positives
+        if any(keyword in name for keyword in ['wte', 'cross_attn', 'speaker', 'adapter']) or \
+           name.endswith('token_embeddings') or 'token_embed' in name:
+            text_params.append(param)
+        else:
+            base_params.append(param)
+    
+    param_groups = [
+        {'params': base_params, 'lr': base_lr},
+        {'params': text_params, 'lr': text_lr},
+    ]
+    
+    opt = torch.optim.AdamW(param_groups, betas=betas, weight_decay=weight_decay, fused=True)
 
     pbar = tqdm(range(0, max_steps), ncols=200, dynamic_ncols=True)
     for step in pbar:
@@ -205,20 +237,23 @@ if __name__ == '__main__':
             text_loss_accum += text_loss.detach()
             audio_acc_accum += audio_acc.detach()
             text_acc_accum += text_acc.detach()
-            total_loss = audio_loss + text_factor*text_loss
+            text_factor = get_text_factor(step)
+            total_loss = audio_loss + text_factor * text_loss
             total_loss.backward()
 
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        lr = get_lr(step)
-        for param_group in opt.param_groups:
-            param_group['lr'] = lr
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        base_lr_current = get_lr(step)
+        # Apply different LRs to parameter groups
+        # base_params get base_lr, text_params get lr_ratio times higher
+        opt.param_groups[0]['lr'] = base_lr_current
+        opt.param_groups[1]['lr'] = base_lr_current * lr_ratio
         opt.step()
         torch.cuda.synchronize()
         total_tokens = step * batch_size*seq_len*grad_accum_steps
         end = time.time()
         dt = (end-start)*1000
         tokens_per_second = (batch_size*seq_len*grad_accum_steps) / (end-start)
-        tqdm_log = f'txt_L: {text_loss_accum.item():.3f} | aud_L: {audio_loss_accum.item():.3f} | txt_acc: {text_acc_accum.item():.2%} | aud_acc: {audio_acc_accum.item():.2%} | lr: {lr:.2e} | norm: {norm:.3f} | {dt:.0f}ms | {tokens_per_second:.0f}t/s'
+        tqdm_log = f'txt_L: {text_loss_accum.item():.3f} | aud_L: {audio_loss_accum.item():.3f} | txt_acc: {text_acc_accum.item():.2%} | aud_acc: {audio_acc_accum.item():.2%} | txt_f: {text_factor:.2f} | lr: {base_lr_current:.2e} | norm: {norm:.3f} | {dt:.0f}ms | {tokens_per_second:.0f}t/s'
         pbar.set_description(tqdm_log)
 
     print(f"Training complete. Saving model at {save_path}")
