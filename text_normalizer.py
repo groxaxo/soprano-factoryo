@@ -39,6 +39,6 @@ def normalize_text(text: str) -> str:
     text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
 
     # Remove square brackets (but keep content inside)
-    text = re.sub(r'\[|\]', '', text)
+    text = re.sub(r'[\[\]]', '', text)
 
     return text
