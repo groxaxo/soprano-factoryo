@@ -7,16 +7,22 @@ python train.py --input-dir path/to/files --save-dir path/to/weights
 Args:
 --input-dir: Path to directory of LJSpeech-style dataset. If none is provided this defaults to the provided example dataset.
 --save-dir: Path to directory to save weights
+--train-decoder: Enable decoder training with waveform loss
+--decoder-lr-mult: Learning rate multiplier for decoder (default: 0.1)
+--decoder-loss-weight: Weight for decoder loss (default: 0.05)
+--freeze-decoder-steps: Steps before unfreezing decoder (default: 800)
 
 Adapted from https://github.com/karpathy/nanoGPT
 """
 import argparse
+import os
 import pathlib
 import random
 import time
 
 import numpy as np
 import torch
+import torchaudio
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -34,6 +40,36 @@ def get_args():
     parser.add_argument("--save-dir",
         required=True,
         type=pathlib.Path
+    )
+    # Decoder training flags
+    parser.add_argument("--train-decoder",
+        action="store_true",
+        help="Enable decoder training with waveform loss"
+    )
+    parser.add_argument("--decoder-lr-mult",
+        type=float,
+        default=0.1,
+        help="Learning rate multiplier for decoder parameters (default: 0.1)"
+    )
+    parser.add_argument("--decoder-loss-weight",
+        type=float,
+        default=0.05,
+        help="Weight for decoder waveform loss (default: 0.05)"
+    )
+    parser.add_argument("--freeze-decoder-steps",
+        type=int,
+        default=800,
+        help="Number of steps to keep decoder frozen before training (default: 800)"
+    )
+    parser.add_argument("--decoder-step-freq",
+        type=int,
+        default=4,
+        help="Train decoder every N steps (default: 4)"
+    )
+    parser.add_argument("--base-model",
+        type=str,
+        default="ekwek/Soprano-80M",
+        help="Base model to load decoder from (default: ekwek/Soprano-80M)"
     )
     return parser.parse_args()
 
@@ -83,29 +119,31 @@ def get_text_factor(it):
     else:
         return 0.15  # cap at 0.15
 
-def collate_pack(texts):
+def collate_pack(batch):
+    # Extract text from dict items
+    texts = [item["text"] for item in batch]
     tokens_batch = tokenizer(texts, padding=False, truncation=False)
-    batch = []
+    packed_batch = []
     cur_sample, cur_size = [], 0
     for i in range(len(texts)):
         tokens = torch.tensor(tokens_batch['input_ids'][i][:-1], dtype=torch.long)
         cur_size += tokens.size(0)
         cur_sample.append(tokens)
         if cur_size >= seq_len + 1:
-            batch.append(torch.cat(cur_sample)[: seq_len + 1])
+            packed_batch.append(torch.cat(cur_sample)[: seq_len + 1])
             cur_sample, cur_size = [], 0
-            if len(batch) == batch_size:
+            if len(packed_batch) == batch_size:
                 break
-    if cur_sample and not batch: # add partial sample if there isn't enough data
-        batch.append(torch.cat(cur_sample + [torch.zeros(seq_len, dtype=torch.long)])[: seq_len + 1])
-    if len(batch) < batch_size:
+    if cur_sample and not packed_batch: # add partial sample if there isn't enough data
+        packed_batch.append(torch.cat(cur_sample + [torch.zeros(seq_len, dtype=torch.long)])[: seq_len + 1])
+    if len(packed_batch) < batch_size:
         # pad up to batch_size for consistency
-        pad = batch[-1]
-        while len(batch) < batch_size:
-            batch.append(pad)
-    batch = torch.stack(batch)
-    x = batch[:, :-1]
-    y = batch[:, 1:]
+        pad = packed_batch[-1]
+        while len(packed_batch) < batch_size:
+            packed_batch.append(pad)
+    packed_batch = torch.stack(packed_batch)
+    x = packed_batch[:, :-1]
+    y = packed_batch[:, 1:]
     return x, y
 
 def compute_loss(logits, y, num_steps):
@@ -154,14 +192,52 @@ if __name__ == '__main__':
         torch.cuda.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
     print(f"Save Path: {save_path}")
+    
+    # Decoder training setup
+    if args.train_decoder:
+        print("Decoder training enabled")
+        print(f"  Decoder LR multiplier: {args.decoder_lr_mult}")
+        print(f"  Decoder loss weight: {args.decoder_loss_weight}")
+        print(f"  Freeze decoder steps: {args.freeze_decoder_steps}")
+        print(f"  Decoder step frequency: every {args.decoder_step_freq} steps")
+        
+        from decoder import SopranoDecoder
+        from loss_audio import audio_decoder_loss
+        from collate_utterance import collate_utterance
+        from functools import partial
+        
+        # Audio token ID range (Soprano uses tokens 3-8003 for audio)
+        AUDIO_MIN = 3
+        AUDIO_MAX = 8003
 
     # tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
 
     # model
-    model = AutoModelForCausalLM.from_pretrained('ekwek/Soprano-80M')
+    model = AutoModelForCausalLM.from_pretrained(args.base_model)
     model.to(torch.bfloat16).to(device)
     model.train()
+    
+    # Get LLM hidden dimension for decoder
+    llm_hidden_dim = model.config.hidden_size
+    
+    # Load or initialize decoder
+    decoder = None
+    if args.train_decoder:
+        try:
+            # Try to load existing decoder
+            decoder = SopranoDecoder.from_pretrained(args.base_model, device=device)
+            print(f"Loaded decoder from {args.base_model}")
+        except FileNotFoundError:
+            # Initialize new decoder
+            print(f"Initializing new decoder (hidden_dim={llm_hidden_dim})")
+            decoder = SopranoDecoder(
+                input_dim=llm_hidden_dim,
+                hidden_dim=512,
+                num_layers=4,
+            )
+        decoder.to(torch.bfloat16).to(device)
+        decoder.train()
 
     # dataset
     dataset = AudioDataset(train_dataset_path)
@@ -176,6 +252,23 @@ if __name__ == '__main__':
         collate_fn=collate_pack,
     )
     dataloader_it = iter(dataloader)
+    
+    # Decoder dataloader (utterance-level batching to maintain waveform alignment)
+    decoder_dataloader = None
+    decoder_dataloader_it = None
+    if args.train_decoder:
+        decoder_collate_fn = partial(collate_utterance, tokenizer=tokenizer, seq_len=seq_len)
+        decoder_dataloader = DataLoader(dataset,
+            batch_size=batch_size,  # No packing, one utterance per sequence
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            persistent_workers=True,
+            worker_init_fn=worker_seed_init,
+            collate_fn=decoder_collate_fn,
+        )
+        decoder_dataloader_it = iter(decoder_dataloader)
+    
     val_dataset = AudioDataset(val_dataset_path)
     val_dataloader = DataLoader(val_dataset,
         batch_size=batch_size * 16,
@@ -205,9 +298,19 @@ if __name__ == '__main__':
             base_params.append(param)
     
     param_groups = [
-        {'params': base_params, 'lr': base_lr},
-        {'params': text_params, 'lr': text_lr},
+        {'params': base_params, 'lr': base_lr, 'group_name': 'base'},
+        {'params': text_params, 'lr': text_lr, 'group_name': 'text'},
     ]
+    
+    # Add decoder parameters if decoder training enabled
+    if args.train_decoder:
+        decoder_params = list(decoder.parameters())
+        param_groups.append({
+            'params': decoder_params,
+            'lr': base_lr * args.decoder_lr_mult,
+            'weight_decay': 0.0,
+            'group_name': 'decoder'
+        })
     
     opt = torch.optim.AdamW(param_groups, betas=betas, weight_decay=weight_decay, fused=True)
 
@@ -216,47 +319,180 @@ if __name__ == '__main__':
         start = time.time()
         if val_freq>0 and (step % val_freq == 0 or step==max_steps-1):
             evaluate(val_dataloader)
+        
+        # Decoder freeze/unfreeze schedule
+        if args.train_decoder:
+            if step < args.freeze_decoder_steps:
+                decoder.eval()
+                for p in decoder.parameters():
+                    p.requires_grad = False
+            else:
+                decoder.train()
+                for p in decoder.parameters():
+                    p.requires_grad = True
+
+        # Decide if this is a decoder training step
+        is_decoder_step = args.train_decoder and step >= args.freeze_decoder_steps and (step % args.decoder_step_freq == 0)
 
         opt.zero_grad()
         audio_loss_accum = 0.0
         text_loss_accum = 0.0
         audio_acc_accum = 0.0
         text_acc_accum = 0.0
-        for micro_step in range(grad_accum_steps):
+        decoder_loss_accum = 0.0
+        
+        if is_decoder_step:
+            # Decoder training step with utterance batches
             try:
-                x, y = next(dataloader_it)
+                x, y, wav_paths = next(decoder_dataloader_it)
             except:
-                dataloader_it = iter(dataloader)
-                x, y = next(dataloader_it)
+                decoder_dataloader_it = iter(decoder_dataloader)
+                x, y, wav_paths = next(decoder_dataloader_it)
             x, y = x.to(device), y.to(device)
-
+            
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits = model(x).logits
-                audio_loss, text_loss, audio_acc, text_acc = compute_loss(logits, y, grad_accum_steps)
-            audio_loss_accum += audio_loss.detach()
-            text_loss_accum += text_loss.detach()
-            audio_acc_accum += audio_acc.detach()
-            text_acc_accum += text_acc.detach()
-            text_factor = get_text_factor(step)
-            total_loss = audio_loss + text_factor * text_loss
-            total_loss.backward()
+                # Get hidden states from LLM
+                out = model(x, output_hidden_states=True)
+                logits = out.logits
+                hidden_states = out.hidden_states[-1]  # [B, T, D]
+                
+                # Compute LM loss
+                audio_loss, text_loss, audio_acc, text_acc = compute_loss(logits, y, 1)
+                audio_loss_accum += audio_loss.detach()
+                text_loss_accum += text_loss.detach()
+                audio_acc_accum += audio_acc.detach()
+                text_acc_accum += text_acc.detach()
+                
+                text_factor = get_text_factor(step)
+                lm_loss = audio_loss + text_factor * text_loss
+                
+                # Extract hidden states for audio tokens
+                # y contains the target tokens, identify audio tokens
+                is_audio = (y >= AUDIO_MIN) & (y <= AUDIO_MAX)  # [B, T]
+                
+                # Align hidden states with targets: LM hidden state at position i predicts token at position i+1
+                # So we shift hidden_states forward by 1 to align with y (the targets)
+                h_for_y = hidden_states[:, 1:, :]  # [B, T, D]
+                
+                # Process each sample in batch
+                total_decoder_loss = 0.0
+                num_decoder_samples = 0
+                
+                for b in range(y.size(0)):
+                    if wav_paths[b] is None:
+                        continue
+                        
+                    # Get audio token positions for this sample
+                    mask_b = is_audio[b]  # [T]
+                    if mask_b.sum() == 0:
+                        continue
+                    
+                    # Extract hidden states for audio tokens
+                    h_audio = h_for_y[b, mask_b, :]  # [T_audio, D]
+                    
+                    # Load ground truth waveform
+                    try:
+                        gt_wav, sr = torchaudio.load(wav_paths[b])
+                    except (FileNotFoundError, RuntimeError) as e:
+                        print(f"\nWarning: Failed to load {wav_paths[b]}: {e}")
+                        continue
+                    
+                    try:
+                        if sr != 32000:
+                            gt_wav = torchaudio.functional.resample(gt_wav, sr, 32000)
+                        gt_wav = gt_wav.to(device)
+                        
+                        # Generate predicted waveform from decoder
+                        pred_wav = decoder(h_audio.unsqueeze(0))  # [1, 1, L]
+                        
+                        # Match lengths by truncating or padding
+                        pred_len = pred_wav.size(-1)
+                        gt_len = gt_wav.size(-1)
+                        min_len = min(pred_len, gt_len)
+                        
+                        pred_wav = pred_wav[..., :min_len]
+                        gt_wav = gt_wav[..., :min_len].unsqueeze(0)  # [1, 1, L]
+                        
+                        # Compute decoder loss
+                        dec_loss, _ = audio_decoder_loss(pred_wav, gt_wav)
+                        total_decoder_loss += dec_loss
+                        num_decoder_samples += 1
+                        
+                    except Exception as e:
+                        print(f"\nWarning: Failed to process audio for {wav_paths[b]}: {e}")
+                        continue
+                
+                # Average decoder loss
+                if num_decoder_samples > 0:
+                    avg_decoder_loss = total_decoder_loss / num_decoder_samples
+                    decoder_loss_accum = avg_decoder_loss.detach()
+                    
+                    # Combined loss
+                    total_loss = lm_loss + args.decoder_loss_weight * avg_decoder_loss
+                else:
+                    total_loss = lm_loss
+                
+                total_loss.backward()
+        else:
+            # Regular LM training step with packed batches
+            for micro_step in range(grad_accum_steps):
+                try:
+                    x, y = next(dataloader_it)
+                except:
+                    dataloader_it = iter(dataloader)
+                    x, y = next(dataloader_it)
+                x, y = x.to(device), y.to(device)
 
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits = model(x).logits
+                    audio_loss, text_loss, audio_acc, text_acc = compute_loss(logits, y, grad_accum_steps)
+                audio_loss_accum += audio_loss.detach()
+                text_loss_accum += text_loss.detach()
+                audio_acc_accum += audio_acc.detach()
+                text_acc_accum += text_acc.detach()
+                text_factor = get_text_factor(step)
+                total_loss = audio_loss + text_factor * text_loss
+                total_loss.backward()
+
+        # Gradient clipping and optimizer step
+        if args.train_decoder:
+            # Clip gradients for both model and decoder
+            norm_model = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            norm_decoder = torch.nn.utils.clip_grad_norm_(decoder.parameters(), grad_clip)
+            norm = max(norm_model, norm_decoder)
+        else:
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
         base_lr_current = get_lr(step)
         # Apply different LRs to parameter groups
-        # base_params get base_lr, text_params get lr_ratio times higher
         opt.param_groups[0]['lr'] = base_lr_current
         opt.param_groups[1]['lr'] = base_lr_current * lr_ratio
+        if args.train_decoder:
+            opt.param_groups[2]['lr'] = base_lr_current * args.decoder_lr_mult
+        
         opt.step()
         torch.cuda.synchronize()
         total_tokens = step * batch_size*seq_len*grad_accum_steps
         end = time.time()
         dt = (end-start)*1000
         tokens_per_second = (batch_size*seq_len*grad_accum_steps) / (end-start)
-        tqdm_log = f'txt_L: {text_loss_accum.item():.3f} | aud_L: {audio_loss_accum.item():.3f} | txt_acc: {text_acc_accum.item():.2%} | aud_acc: {audio_acc_accum.item():.2%} | txt_f: {text_factor:.2f} | lr: {base_lr_current:.2e} | norm: {norm:.3f} | {dt:.0f}ms | {tokens_per_second:.0f}t/s'
+        
+        # Update progress bar
+        if args.train_decoder and is_decoder_step:
+            tqdm_log = f'txt_L: {text_loss_accum.item():.3f} | aud_L: {audio_loss_accum.item():.3f} | dec_L: {decoder_loss_accum.item():.3f} | txt_acc: {text_acc_accum.item():.2%} | aud_acc: {audio_acc_accum.item():.2%} | txt_f: {text_factor:.2f} | lr: {base_lr_current:.2e} | norm: {norm:.3f} | {dt:.0f}ms | [DEC]'
+        else:
+            tqdm_log = f'txt_L: {text_loss_accum.item():.3f} | aud_L: {audio_loss_accum.item():.3f} | txt_acc: {text_acc_accum.item():.2%} | aud_acc: {audio_acc_accum.item():.2%} | txt_f: {text_factor:.2f} | lr: {base_lr_current:.2e} | norm: {norm:.3f} | {dt:.0f}ms | {tokens_per_second:.0f}t/s'
         pbar.set_description(tqdm_log)
 
     print(f"Training complete. Saving model at {save_path}")
     model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
+    
+    # Save decoder if training was enabled
+    if args.train_decoder:
+        os.makedirs(save_path, exist_ok=True)
+        decoder_path = os.path.join(save_path, "decoder.pth")
+        torch.save(decoder.state_dict(), decoder_path)
+        print(f"Saved decoder to {decoder_path}")
+    
     print("Saving done.")

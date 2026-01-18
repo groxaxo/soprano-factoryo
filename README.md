@@ -60,6 +60,8 @@ Args:
 
 ### 3. Model Training
 
+#### Basic Training (LLM only)
+
 ```
 python train.py --input-dir path/to/files --save-dir path/to/weights
 
@@ -67,6 +69,24 @@ Args:
   --input-dir:  Path to directory of LJSpeech-style dataset. If none is provided this defaults to the provided example dataset.
   --save-dir:   Path to directory to save weights
 ```
+
+#### Joint Decoder Training (LLM + Decoder)
+
+The decoder is a Vocos-based model that converts LLM hidden states to waveforms. By default, the decoder is frozen during training. To enable joint training of both the LLM and decoder:
+
+```
+python train.py --input-dir path/to/files --save-dir path/to/weights --train-decoder
+
+Args:
+  --train-decoder:              Enable decoder training with waveform loss
+  --decoder-lr-mult:            Learning rate multiplier for decoder (default: 0.1)
+  --decoder-loss-weight:        Weight for decoder waveform loss (default: 0.05)
+  --freeze-decoder-steps:       Steps before unfreezing decoder (default: 800)
+  --decoder-step-freq:          Train decoder every N steps (default: 4)
+  --base-model:                 Base model to load decoder from (default: ekwek/Soprano-80M)
+```
+
+**Note**: Decoder training uses utterance-level batching (not packed sequences) to maintain waveform alignment. The decoder is trained every N steps (default: 4) with a combined loss of mel-spectrogram and multi-resolution STFT.
 
 ### 4. Inference
 Once the model has been trained, you can then use the custom weights in the [Soprano repository](https://github.com/ekwek1/soprano)! Just pass your save directory into model_path.
