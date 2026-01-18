@@ -206,7 +206,7 @@ if __name__ == '__main__':
         from collate_utterance import collate_utterance
         from functools import partial
         
-        # Constants for audio token range
+        # Audio token ID range (Soprano uses tokens 3-8003 for audio)
         AUDIO_MIN = 3
         AUDIO_MAX = 8003
 
@@ -253,13 +253,13 @@ if __name__ == '__main__':
     )
     dataloader_it = iter(dataloader)
     
-    # Decoder dataloader (for utterance-level batching)
+    # Decoder dataloader (utterance-level batching to maintain waveform alignment)
     decoder_dataloader = None
     decoder_dataloader_it = None
     if args.train_decoder:
         decoder_collate_fn = partial(collate_utterance, tokenizer=tokenizer, seq_len=seq_len)
         decoder_dataloader = DataLoader(dataset,
-            batch_size=batch_size,  # smaller batch for decoder
+            batch_size=batch_size,  # No packing, one utterance per sequence
             shuffle=True,
             num_workers=2,
             pin_memory=True,
@@ -370,8 +370,9 @@ if __name__ == '__main__':
                 # y contains the target tokens, identify audio tokens
                 is_audio = (y >= AUDIO_MIN) & (y <= AUDIO_MAX)  # [B, T]
                 
-                # Align hidden states with y (shift by 1)
-                h_for_y = hidden_states[:, 1:, :]  # Shift to align with y positions
+                # Align hidden states with targets: LM hidden state at position i predicts token at position i+1
+                # So we shift hidden_states forward by 1 to align with y (the targets)
+                h_for_y = hidden_states[:, 1:, :]  # [B, T, D]
                 
                 # Process each sample in batch
                 total_decoder_loss = 0.0
@@ -392,6 +393,11 @@ if __name__ == '__main__':
                     # Load ground truth waveform
                     try:
                         gt_wav, sr = torchaudio.load(wav_paths[b])
+                    except (FileNotFoundError, RuntimeError) as e:
+                        print(f"\nWarning: Failed to load {wav_paths[b]}: {e}")
+                        continue
+                    
+                    try:
                         if sr != 32000:
                             gt_wav = torchaudio.functional.resample(gt_wav, sr, 32000)
                         gt_wav = gt_wav.to(device)
@@ -413,7 +419,7 @@ if __name__ == '__main__':
                         num_decoder_samples += 1
                         
                     except Exception as e:
-                        print(f"\nWarning: Failed to load/process {wav_paths[b]}: {e}")
+                        print(f"\nWarning: Failed to process audio for {wav_paths[b]}: {e}")
                         continue
                 
                 # Average decoder loss

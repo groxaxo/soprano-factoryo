@@ -26,7 +26,7 @@ def stft_loss(x, y, fft_sizes=(1024, 2048, 512), hop_sizes=(256, 512, 128), win_
     if y.dim() == 3:
         y = y.squeeze(1)
     
-    loss = 0.0
+    total_loss = 0.0
     for n_fft, hop, win in zip(fft_sizes, hop_sizes, win_lengths):
         # Compute STFT
         window = torch.hann_window(win).to(x.device)
@@ -36,9 +36,10 @@ def stft_loss(x, y, fft_sizes=(1024, 2048, 512), hop_sizes=(256, 512, 128), win_
                        window=window, return_complex=True, center=True)
         
         # Magnitude loss (L1)
-        loss = loss + (X.abs() - Y.abs()).abs().mean()
+        magnitude_loss = (X.abs() - Y.abs()).abs().mean()
+        total_loss = total_loss + magnitude_loss
         
-    return loss / len(fft_sizes)
+    return total_loss / len(fft_sizes)
 
 
 def mel_loss(x, y, sr=32000, n_mels=128, n_fft=1024, hop_length=256):

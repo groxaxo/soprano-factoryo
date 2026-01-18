@@ -38,7 +38,9 @@ class ISTFTHead(nn.Module):
         
         mag, phase = x.chunk(2, dim=1)  # each [B, (n_fft+2)//2, T]
         mag = torch.exp(mag)
-        phase = torch.sin(phase)  # Simple phase estimation
+        # Note: Using sin() for phase is a simplification. More sophisticated methods
+        # like Griffin-Lim or learned phase prediction could improve quality.
+        phase = torch.sin(phase)
         
         # Construct complex spectrogram
         S = mag * torch.exp(1j * phase)

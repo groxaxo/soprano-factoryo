@@ -65,6 +65,7 @@ def main():
     dataset = []
     for sample in tqdm(files):
         filename, transcript = sample
+        # Use absolute path to ensure wav can be loaded from any working directory
         wav_path = f'{input_dir}/wavs/{filename}.wav'
         sr, audio = wavfile.read(wav_path)
         audio = torch.from_numpy(audio)

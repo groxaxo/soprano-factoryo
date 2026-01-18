@@ -35,16 +35,10 @@ def collate_utterance(batch, tokenizer, seq_len):
         t = t[: seq_len + 1]
         tokens.append(t)
     
-    # Pad to max len in batch
-    max_t = max(t.numel() for t in tokens)
-    pad_id = tokenizer.pad_token_id
-    tokens_padded = []
-    for t in tokens:
-        if t.numel() < max_t:
-            t = torch.cat([t, torch.full((max_t - t.numel(),), pad_id, dtype=torch.long)])
-        tokens_padded.append(t)
+    # Pad to max len in batch using pad_sequence for efficiency
+    from torch.nn.utils.rnn import pad_sequence
+    tokens_padded = pad_sequence(tokens, batch_first=True, padding_value=tokenizer.pad_token_id)
     
-    tokens_padded = torch.stack(tokens_padded)  # [B, T]
     x = tokens_padded[:, :-1]
     y = tokens_padded[:, 1:]
     
