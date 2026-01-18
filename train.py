@@ -83,29 +83,31 @@ def get_text_factor(it):
     else:
         return 0.15  # cap at 0.15
 
-def collate_pack(texts):
+def collate_pack(batch):
+    # Extract text from dict items
+    texts = [item["text"] for item in batch]
     tokens_batch = tokenizer(texts, padding=False, truncation=False)
-    batch = []
+    packed_batch = []
     cur_sample, cur_size = [], 0
     for i in range(len(texts)):
         tokens = torch.tensor(tokens_batch['input_ids'][i][:-1], dtype=torch.long)
         cur_size += tokens.size(0)
         cur_sample.append(tokens)
         if cur_size >= seq_len + 1:
-            batch.append(torch.cat(cur_sample)[: seq_len + 1])
+            packed_batch.append(torch.cat(cur_sample)[: seq_len + 1])
             cur_sample, cur_size = [], 0
-            if len(batch) == batch_size:
+            if len(packed_batch) == batch_size:
                 break
-    if cur_sample and not batch: # add partial sample if there isn't enough data
-        batch.append(torch.cat(cur_sample + [torch.zeros(seq_len, dtype=torch.long)])[: seq_len + 1])
-    if len(batch) < batch_size:
+    if cur_sample and not packed_batch: # add partial sample if there isn't enough data
+        packed_batch.append(torch.cat(cur_sample + [torch.zeros(seq_len, dtype=torch.long)])[: seq_len + 1])
+    if len(packed_batch) < batch_size:
         # pad up to batch_size for consistency
-        pad = batch[-1]
-        while len(batch) < batch_size:
-            batch.append(pad)
-    batch = torch.stack(batch)
-    x = batch[:, :-1]
-    y = batch[:, 1:]
+        pad = packed_batch[-1]
+        while len(packed_batch) < batch_size:
+            packed_batch.append(pad)
+    packed_batch = torch.stack(packed_batch)
+    x = packed_batch[:, :-1]
+    y = packed_batch[:, 1:]
     return x, y
 
 def compute_loss(logits, y, num_steps):

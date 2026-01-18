@@ -65,14 +65,20 @@ def main():
     dataset = []
     for sample in tqdm(files):
         filename, transcript = sample
-        sr, audio = wavfile.read(f'{input_dir}/wavs/{filename}.wav')
+        wav_path = f'{input_dir}/wavs/{filename}.wav'
+        sr, audio = wavfile.read(wav_path)
         audio = torch.from_numpy(audio)
         if sr != SAMPLE_RATE:
             audio = torchaudio.functional.resample(audio, sr, SAMPLE_RATE)
         audio = audio.unsqueeze(0)
         with torch.no_grad():
             audio_tokens = encoder(audio)
-        dataset.append([transcript, audio_tokens.squeeze(0).tolist()])
+        # Now store as dict with wav_path for decoder training
+        dataset.append({
+            "text": transcript,
+            "tokens": audio_tokens.squeeze(0).tolist(),
+            "wav_path": wav_path
+        })
 
     print("Generating train/test splits.")
     random.seed(SEED)
